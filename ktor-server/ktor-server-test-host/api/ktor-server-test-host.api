@@ -105,6 +105,7 @@ public final class io/ktor/server/testing/TestApplicationCall : io/ktor/server/e
 	public synthetic fun getResponse ()Lio/ktor/server/engine/BaseApplicationResponse;
 	public synthetic fun getResponse ()Lio/ktor/server/response/ApplicationResponse;
 	public fun getResponse ()Lio/ktor/server/testing/TestApplicationResponse;
+	public fun onCallFinish (Lkotlin/jvm/functions/Function1;)V
 	public fun toString ()Ljava/lang/String;
 }
 
