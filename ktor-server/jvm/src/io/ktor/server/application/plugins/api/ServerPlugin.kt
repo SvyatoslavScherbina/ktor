@@ -15,36 +15,6 @@ import io.ktor.util.pipeline.*
 import kotlin.random.Random
 
 /**
- * Gets plugin instance for this pipeline, or fails with [MissingApplicationPluginException] if the feature is not
- * installed.
- * @throws MissingApplicationPluginException
- * @param plugin plugin to lookup
- * @return an instance of plugin
- */
-public fun <A : Pipeline<*, ApplicationCall>, ConfigurationT : Any> A.plugin(
-    plugin: ServerPluginFactory<ConfigurationT>
-): ServerPlugin<ConfigurationT> {
-    return attributes[pluginRegistryKey].getOrNull(plugin.key)
-        ?: throw MissingApplicationPluginException(plugin.key)
-}
-
-internal fun <A : Pipeline<*, ApplicationCall>> A.findInterceptionsHolder(
-    plugin: ServerPluginFactory<*>
-): ServerPlugin<*> {
-    return attributes[pluginRegistryKey].getOrNull(plugin.key)
-        ?: throw MissingApplicationPluginException(plugin.key)
-}
-
-/**
- * Factory class that can be passed to install function in order to produce an instance of [ServerPlugin]
- * that will be installed into the current application context.
- **/
-public abstract class ServerPluginFactory<Configuration : Any>(public val name: String) :
-    ApplicationPlugin<ApplicationCallPipeline, Configuration, ServerPlugin<Configuration>>
-
-internal typealias PipelineHandler = (Pipeline<*, ApplicationCall>) -> Unit
-
-/**
  * A plugin for Ktor that embeds into the HTTP pipeline and extends functionality of Ktor framework.
  **/
 public abstract class ServerPlugin<Configuration : Any> private constructor(
@@ -77,7 +47,7 @@ public abstract class ServerPlugin<Configuration : Any> private constructor(
 
     internal val pipelineHandlers: MutableList<PipelineHandler> = mutableListOf()
 
-    private fun newPhase(): PipelinePhase = PipelinePhase("${name}Phase${Random.nextInt()}")
+    internal fun newPhase(): PipelinePhase = PipelinePhase("${name}Phase${Random.nextInt()}")
 
     private fun <T : Any, ContextT : CallHandlingContext> onDefaultPhaseWithMessage(
         interceptions: MutableList<Interception<T>>,
@@ -165,169 +135,6 @@ public abstract class ServerPlugin<Configuration : Any> private constructor(
     }
 
     /**
-     * A [PluginContext] context that allows inserting [currentPlugin] actions relatively (before/after) to [otherPlugins].
-     **/
-    public abstract class RelativePluginContext(
-        private val currentPlugin: ServerPlugin<*>,
-        private val otherPlugins: List<ServerPlugin<*>>
-    ) : PluginContext {
-        private fun <T : Any> sortedPhases(
-            interceptions: List<Interception<T>>,
-            pipeline: Pipeline<*, ApplicationCall>,
-            otherPlugin: ServerPlugin<*>
-        ): List<PipelinePhase> =
-            interceptions
-                .map { it.phase }
-                .sortedBy {
-                    if (!pipeline.items.contains(it)) {
-                        throw PluginNotInstalledException(otherPlugin.name)
-                    }
-
-                    pipeline.items.indexOf(it)
-                }
-
-        public abstract fun selectPhase(phases: List<PipelinePhase>): PipelinePhase?
-
-        public abstract fun insertPhase(
-            pipeline: Pipeline<*, ApplicationCall>,
-            relativePhase: PipelinePhase,
-            newPhase: PipelinePhase
-        )
-
-        private fun <T : Any, ContextT : CallHandlingContext> insertToPhaseRelativelyWithMessage(
-            currentInterceptions: MutableList<Interception<T>>,
-            otherInterceptionsList: List<MutableList<Interception<T>>>,
-            contextInit: (PipelineContext<T, ApplicationCall>) -> ContextT,
-            block: suspend ContextT.(ApplicationCall, Any) -> Unit
-        ) {
-            val currentPhase = currentPlugin.newPhase()
-
-            currentInterceptions.add(
-                Interception(
-                    currentPhase,
-                    action = { pipeline ->
-                        for (i in otherPlugins.indices) {
-                            val otherPlugin = otherPlugins[i]
-                            val otherInterceptions = otherInterceptionsList[i]
-
-                            val otherPhases = sortedPhases(otherInterceptions, pipeline, otherPlugin)
-                            selectPhase(otherPhases)?.let { lastDependentPhase ->
-                                insertPhase(pipeline, lastDependentPhase, currentPhase)
-                            }
-                        }
-
-                        pipeline.intercept(currentPhase) {
-                            contextInit(this).block(call, subject)
-                        }
-                    }
-                )
-            )
-        }
-
-        private fun <T : Any, ContextT : CallHandlingContext> insertToPhaseRelatively(
-            currentInterceptions: MutableList<Interception<T>>,
-            otherInterceptions: List<MutableList<Interception<T>>>,
-            contextInit: (PipelineContext<T, ApplicationCall>) -> ContextT,
-            block: suspend ContextT.(ApplicationCall) -> Unit
-        ) = insertToPhaseRelativelyWithMessage(currentInterceptions, otherInterceptions, contextInit) { call, _ ->
-            block(call)
-        }
-
-        override val onCall: OnCall = object : OnCall {
-            override operator fun invoke(block: suspend CallContext.(ApplicationCall) -> Unit) {
-                insertToPhaseRelatively(
-                    currentPlugin.callInterceptions,
-                    otherPlugins.map { it.callInterceptions },
-                    ::CallContext
-                ) { call -> block(call) }
-            }
-        }
-
-        override val onCallReceive: OnCallReceive = object : OnCallReceive {
-            override operator fun invoke(block: suspend CallReceiveContext.(ApplicationCall) -> Unit) {
-                insertToPhaseRelatively(
-                    currentPlugin.onReceiveInterceptions,
-                    otherPlugins.map { it.onReceiveInterceptions },
-                    ::CallReceiveContext,
-                    block
-                )
-            }
-        }
-
-        override val onCallRespond: OnCallRespond = object : OnCallRespond {
-            override operator fun invoke(block: suspend CallRespondContext.(ApplicationCall) -> Unit) {
-                insertToPhaseRelatively(
-                    currentPlugin.onResponseInterceptions,
-                    otherPlugins.map { it.onResponseInterceptions },
-                    ::CallRespondContext,
-                    block
-                )
-            }
-
-            override fun afterTransform(
-                block: suspend CallRespondAfterTransformContext.(ApplicationCall, Any) -> Unit
-            ) {
-                insertToPhaseRelativelyWithMessage(
-                    currentPlugin.afterResponseInterceptions,
-                    otherPlugins.map { it.afterResponseInterceptions },
-                    ::CallRespondAfterTransformContext,
-                    block
-                )
-            }
-        }
-
-        @Deprecated(
-            level = DeprecationLevel.WARNING,
-            replaceWith = ReplaceWith("this@createPlugin.applicationShutdownHook"),
-            message = "Please note that applicationShutdownHook is not guaranteed to be executed before " +
-                "or after another plugin"
-        )
-        override fun applicationShutdownHook(hook: (Application) -> Unit) {
-            currentPlugin.environment?.monitor?.subscribe(ApplicationStopped) { app ->
-                hook(app)
-            }
-        }
-    }
-
-    /**
-     * Every handler called in this context will be executed only after same handler has finished for all [otherPlugins].
-     **/
-    public class AfterPluginContext(
-        currentPlugin: ServerPlugin<*>,
-        otherPlugins: List<ServerPlugin<*>>
-    ) :
-        RelativePluginContext(currentPlugin, otherPlugins) {
-        override fun selectPhase(phases: List<PipelinePhase>): PipelinePhase? = phases.lastOrNull()
-
-        override fun insertPhase(
-            pipeline: Pipeline<*, ApplicationCall>,
-            relativePhase: PipelinePhase,
-            newPhase: PipelinePhase
-        ) {
-            pipeline.insertPhaseAfter(relativePhase, newPhase)
-        }
-    }
-
-    /**
-     * Every handler called in this context will be executed only before same handler has finished for all [otherPlugins].
-     **/
-    public class BeforePluginsContext(
-        currentPlugin: ServerPlugin<*>,
-        otherPlugins: List<ServerPlugin<*>>
-    ) :
-        RelativePluginContext(currentPlugin, otherPlugins) {
-        override fun selectPhase(phases: List<PipelinePhase>): PipelinePhase? = phases.firstOrNull()
-
-        override fun insertPhase(
-            pipeline: Pipeline<*, ApplicationCall>,
-            relativePhase: PipelinePhase,
-            newPhase: PipelinePhase
-        ) {
-            pipeline.insertPhaseBefore(relativePhase, newPhase)
-        }
-    }
-
-    /**
      * Execute some actions right after all [targetPlugins] were already executed.
      *
      * Note: you can define multiple actions inside a [build] callback for multiple stages of handling an HTTP call
@@ -339,7 +146,7 @@ public abstract class ServerPlugin<Configuration : Any> private constructor(
         build: AfterPluginContext.() -> Unit
     ) {
         pipelineHandlers.add { pipeline ->
-            AfterPluginContext(this, targetPlugins.map { pipeline.findInterceptionsHolder(it) }).build()
+            AfterPluginContext(this, targetPlugins.map { pipeline.findServerPlugin(it) }).build()
         }
     }
 
@@ -356,7 +163,7 @@ public abstract class ServerPlugin<Configuration : Any> private constructor(
         build: BeforePluginsContext.() -> Unit
     ) {
         pipelineHandlers.add { pipeline ->
-            BeforePluginsContext(this, targetPlugins.map { pipeline.findInterceptionsHolder(it) }).build()
+            BeforePluginsContext(this, targetPlugins.map { pipeline.findServerPlugin(it) }).build()
         }
     }
 
@@ -439,13 +246,3 @@ public abstract class ServerPlugin<Configuration : Any> private constructor(
         }
     }
 }
-
-/**
- * Port of the current application. Same as in config.
- **/
-public val ApplicationConfig.port: Int get() = propertyOrNull("ktor.deployment.port")?.getString()?.toInt() ?: 8080
-
-/**
- * Host of the current application. Same as in config.
- **/
-public val ApplicationConfig.host: String get() = propertyOrNull("ktor.deployment.host")?.getString() ?: "0.0.0.0"
